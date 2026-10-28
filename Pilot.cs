@@ -17,7 +17,6 @@ internal sealed unsafe class Pilot(IGameGui gui, IClientState client, IObjectTab
     private bool hadGame;
     private long nextDebugLog;
     private long stopTypingUntil;
-    private bool fastMode;
     public bool Debug { get; set; }
     public bool Armed { get; private set; } = true;
     private string status = "Enabled; waiting for Magitype.";
@@ -55,7 +54,6 @@ internal sealed unsafe class Pilot(IGameGui gui, IClientState client, IObjectTab
         hadGame = false;
         next = 0;
         stopTypingUntil = 0;
-        fastMode = false;
     }
 
     public void Update()
@@ -67,7 +65,7 @@ internal sealed unsafe class Pilot(IGameGui gui, IClientState client, IObjectTab
         }
         if (!Armed) return;
         var wait = !client.IsLoggedIn ? "Waiting for login." : client.IsPvP ? "Waiting: PvP is active." :
-            !Ready() ? queue.Update() ?? "Waiting for Magitype UI." : null;
+            !Ready() ? queue.Update(config.AutoExit == true, config.AutoRequeue) ?? "Waiting for Magitype UI." : null;
         if (wait != null)
         {
             if (hadGame) Reset();
@@ -97,15 +95,7 @@ internal sealed unsafe class Pilot(IGameGui gui, IClientState client, IObjectTab
             Status = "Stop-typing mechanic: waiting for the effect to finish.";
             return;
         }
-        var fast = config.LudicrousSpeed || objects.Any(obj => obj is IBattleChara b && b.ObjectKind == ObjectKind.BattleNpc &&
-            IsDangerousCast(b.IsCasting, b.CurrentCastTime, b.TotalCastTime));
-        if (fast != fastMode)
-        {
-            if (fast) next = Math.Min(next, Environment.TickCount64 + (config.LudicrousSpeed ? 0 : 25));
-            fastMode = fast;
-            log.Information("Magitype Pilot: typing pace changed to {Pace}.", fast ? "fast" : "normal");
-        }
-        if (config.LudicrousSpeed) next = 0;
+        if (config.Speed == TypingSpeed.Ludicrous) next = 0;
         if (Environment.TickCount64 < next) return;
         var words = ReadWords(out var ranks);
         foreach (var entry in pending.ToArray())
@@ -163,7 +153,7 @@ internal sealed unsafe class Pilot(IGameGui gui, IClientState client, IObjectTab
             }
             index = 0;
             log.Information("Magitype Pilot: selected {Kind} phrase with {Length} characters; {Count} candidates.",
-                phrase == priority ? "prioritized" : "nearby", phrase.Length, words.Length);
+                config.Priorities[ranks[phrase]], phrase.Length, words.Length);
             }
         }
         if (!words.Contains(phrase))
@@ -186,8 +176,9 @@ internal sealed unsafe class Pilot(IGameGui gui, IClientState client, IObjectTab
                 return;
             }
             index++;
-            Status = $"Typing {index}/{phrase.Length} characters ({(fast ? "fast" : "normal")}).";
-            next = index == phrase.Length ? 0 : Environment.TickCount64 + (config.LudicrousSpeed ? 0 : fast ? 25 : 100);
+            var pace = config.Speed == TypingSpeed.NinetyWpm ? "90 WPM" : config.Speed?.ToString().ToLowerInvariant();
+            Status = $"Typing {index}/{phrase.Length} characters ({pace}).";
+            next = index == phrase.Length ? 0 : Environment.TickCount64 + config.TypingDelay;
         }
         else
         {
@@ -223,7 +214,10 @@ internal sealed unsafe class Pilot(IGameGui gui, IClientState client, IObjectTab
         if (addon == null) return [];
         var u = &addon->UldManager;
         if (u->NodeList == null || u->NodeListCount > 512) return [];
-        var words = new List<(string Word, float Y, float CenterX)>();
+        var barrierPresent = objects.Any(o => o.ObjectKind == ObjectKind.BattleNpc && o.BaseId == 20079 && o.IsTargetable && !o.IsDead);
+        var barrierNeedsReinforcement = objects.Any(o => o is IBattleChara b && b.ObjectKind == ObjectKind.BattleNpc &&
+            b.BaseId == 20079 && b.IsTargetable && !b.IsDead && b.MaxHp > 0 && b.CurrentHp < b.MaxHp);
+        var words = new List<(string Word, float Y, float CenterX, bool Barrier)>();
         for (var i = 0; i < u->NodeListCount; i++)
         {
             var node = u->NodeList[i];
@@ -236,20 +230,24 @@ internal sealed unsafe class Pilot(IGameGui gui, IClientState client, IObjectTab
             {
                 var text = nested->NodeList[j];
                 if (text == null || text->NodeId != 20 || text->Type != NodeType.Text || !text->IsVisible()) continue;
-                var value = ReadText(((AtkTextNode*)text)->NodeText.StringPtr.Value);
+                var textNode = (AtkTextNode*)text;
+                var value = ReadText(textNode->NodeText.StringPtr.Value);
                 if (IsSafePhrase(value) && float.IsFinite(node->ScreenY) && float.IsFinite(node->ScreenX))
-                    words.Add((value!, node->ScreenY, node->ScreenX + node->Width / 2f));
+                    words.Add((value!, node->ScreenY, node->ScreenX + node->Width / 2f,
+                        IsBarrierLabel(barrierPresent, textNode->TextColor.R, textNode->TextColor.G, textNode->TextColor.B)));
             }
         }
         var targets = words.Select(word => (word.Word, word.Y, word.CenterX,
-            Rank: config.Rank(TargetPriority.Closest), Remaining: float.PositiveInfinity)).ToArray();
+            Rank: word.Barrier ? Math.Min(config.Rank(TargetPriority.Barrier), config.Rank(TargetPriority.Closest)) : config.Rank(TargetPriority.Closest),
+            Remaining: float.PositiveInfinity)).ToArray();
+        var actionableBarrier = barrierNeedsReinforcement && words.Any(word => word.Barrier);
         foreach (var obj in objects)
         {
             if (obj is not IBattleChara b || b.ObjectKind != ObjectKind.BattleNpc || !b.IsCasting ||
                 !gui.WorldToScreen(b.Position, out var position)) continue;
             var isInterrupt = b.CastActionId == 49524 || b.IsCastInterruptible;
             var remaining = b.TotalCastTime - b.CurrentCastTime;
-            if (!IsUrgentCast(isInterrupt, remaining)) continue;
+            if (!ShouldPrioritizeCast(isInterrupt, b.CastActionId, remaining, actionableBarrier)) continue;
             var match = InterruptIndex(words.Select(word => word.CenterX).ToArray(), position.X);
             if (match < 0) continue;
             var target = targets[match];
@@ -261,6 +259,9 @@ internal sealed unsafe class Pilot(IGameGui gui, IClientState client, IObjectTab
             ranks[target.Word] = Math.Min(ranks.GetValueOrDefault(target.Word, int.MaxValue), target.Rank);
         return OrderTargets(targets.Select(t => (t.Word, t.Y, t.Rank, t.Remaining)));
     }
+
+    // The color and object ID were observed together; unknown variants fall back to proximity.
+    internal static bool IsBarrierLabel(bool present, byte r, byte g, byte b) => present && r == 160 && g == 248 && b == 116;
 
     internal static string[] OrderTargets(IEnumerable<(string Word, float Y, int Rank, float Remaining)> targets) =>
         targets.OrderBy(t => t.Rank).ThenBy(t => t.Remaining).ThenByDescending(t => t.Y).Select(t => t.Word).ToArray();
@@ -295,11 +296,12 @@ internal sealed unsafe class Pilot(IGameGui gui, IClientState client, IObjectTab
         while (length < 512 && p[length] != 0) length++;
         return length == 512 ? null : Encoding.UTF8.GetString(new ReadOnlySpan<byte>(p, length));
     }
-    internal static bool IsSafePhrase(string? value) => value is { Length: > 0 and <= 120 } && value.All(c => c is >= ' ' and <= '~') && !string.IsNullOrWhiteSpace(value);
+    internal static bool IsSafePhrase(string? value) => value is { Length: > 0 and <= 120 } && value.All(c => !char.IsControl(c) && !char.IsSurrogate(c)) && !string.IsNullOrWhiteSpace(value);
     internal static bool IsUrgentCast(bool interrupt, float remaining) =>
         interrupt || (float.IsFinite(remaining) && remaining is >= 0 and <= 8);
-    internal static bool IsDangerousCast(bool casting, float elapsed, float total) =>
-        casting && float.IsFinite(elapsed) && float.IsFinite(total) && total > 0 && elapsed >= 0 && elapsed / total >= 0.7f;
+    // An observed long Tankbuster completed despite boss damage; preserve available barrier reinforcement.
+    internal static bool ShouldPrioritizeCast(bool interrupt, uint action, float remaining, bool actionableBarrier) =>
+        IsUrgentCast(interrupt, remaining) && (interrupt || action != 49699 || !actionableBarrier);
     internal static string? FindResumable(IEnumerable<string> words, string text, string? submitted) =>
         text.Length == 0 ? null : words.FirstOrDefault(word => word != submitted && word.StartsWith(text, StringComparison.OrdinalIgnoreCase));
     internal static bool IsStopCast(bool casting, uint action) => casting && action is 49529 or 49532 or 49702;

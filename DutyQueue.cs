@@ -13,13 +13,19 @@ internal sealed unsafe class DutyQueue(IGameGui gui, IClientState client, IObjec
     private uint territory;
     private bool registrationRequested;
 
-    public string? Update()
+    public string? Update(bool autoExit, bool autoRequeue)
     {
         if (territory != client.TerritoryType)
         {
             territory = client.TerritoryType;
             next = 0;
             registrationRequested = false;
+        }
+        if (!ShouldHandle(client.TerritoryType, autoExit, autoRequeue))
+        {
+            next = 0;
+            registrationRequested = false;
+            return null;
         }
         if (client.TerritoryType == 1359)
         {
@@ -64,6 +70,9 @@ internal sealed unsafe class DutyQueue(IGameGui gui, IClientState client, IObjec
         next = Environment.TickCount64 + 5000;
         return "Opening the Magitype registrar.";
     }
+
+    internal static bool ShouldHandle(uint territory, bool autoExit, bool autoRequeue) =>
+        territory == 1359 ? autoExit : territory == 1360 && autoRequeue;
 
     internal static bool CanRegister(bool requested, long now, long retryAt) => !requested || now >= retryAt;
 
