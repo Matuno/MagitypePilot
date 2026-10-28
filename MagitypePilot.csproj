@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project Sdk="Dalamud.NET.Sdk/15.0.0">
+  <PropertyGroup>
+    <Version>0.1.2.0</Version>
+    <Authors>Matuno</Authors>
+    <Description>Experimental automation for the Magitype minigame.</Description>
+    <RepositoryUrl>https://github.com/Matuno/MagitypePilot</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <PackageLicenseExpression>AGPL-3.0-or-later</PackageLicenseExpression>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)' == 'Debug' and Exists('../MagitypePilot.development/tests/WorkspaceTests.cs')">
+    <DefineConstants>$(DefineConstants);WORKSPACE_TESTS</DefineConstants>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(Configuration)' == 'Debug' and Exists('../MagitypePilot.development/tests/WorkspaceTests.cs')">
+    <Compile Include="../MagitypePilot.development/tests/WorkspaceTests.cs" Link="WorkspaceTests.cs" />
+  </ItemGroup>
+</Project>
