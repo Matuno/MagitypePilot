@@ -44,7 +44,7 @@ public sealed partial class Plugin : IDalamudPlugin
         this.commands = commands;
         this.config = pluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
         this.config.Normalize();
-        this.input = new GameInput(gui, agents, scanner, interop, this.config, log);
+        this.input = new GameInput(agents, scanner);
         this.pilot = new Pilot(gui, clientState, objects, log, this.input, new DutyQueue(gui, clientState, objects, conditions), this.config);
         this.framework = framework;
         this.clientState = clientState;
@@ -52,36 +52,29 @@ public sealed partial class Plugin : IDalamudPlugin
         this.directActions = new DirectActions(scanner, log, clientState, objects);
         this.pilot.Direct = this.directActions;
 #if WORKSPACE_TESTS
+        this.directActions.SetInterop(interop);
+        this.pilot.Debug = true;
+        this.directActions.SetDebug(true);
+        this.assemblySha256 = GetAssemblySha256(pluginInterface.AssemblyLocation);
+        this.listTests = pluginInterface.GetIpcProvider<string>(
+            "DalamudWorkspace.ListTests.v1.MagitypePilot");
+        this.runTests = pluginInterface.GetIpcProvider<string, string>(
+            "DalamudWorkspace.RunTests.v1.MagitypePilot");
+
+        this.listTests.RegisterFunc(() => JsonSerializer.Serialize(new[]
+        {
+            new { name = "smoke", readOnly = true, description = "Checks the plugin's current live adapters." },
+        }));
         try
         {
-            this.directActions.SetInterop(interop);
-            this.pilot.Debug = true;
-            this.directActions.SetDebug(true);
-            this.assemblySha256 = GetAssemblySha256(pluginInterface.AssemblyLocation);
-            this.listTests = pluginInterface.GetIpcProvider<string>(
-                "DalamudWorkspace.ListTests.v1.MagitypePilot");
-            this.runTests = pluginInterface.GetIpcProvider<string, string>(
-                "DalamudWorkspace.RunTests.v1.MagitypePilot");
-
-            this.listTests.RegisterFunc(() => JsonSerializer.Serialize(new[]
-            {
-                new { name = "smoke", readOnly = true, description = "Checks the plugin's current live adapters." },
-            }));
-            try
-            {
-                this.runTests.RegisterFunc(this.RunWorkspaceTest);
-            }
-            catch
-            {
-                this.listTests.UnregisterFunc();
-                throw;
-            }
+            this.runTests.RegisterFunc(this.RunWorkspaceTest);
         }
         catch
         {
-            this.input.Dispose();
+            this.listTests.UnregisterFunc();
             throw;
         }
+
 #endif
 
         if (!commands.AddHandler("/magitypepilot", new CommandInfo((_, _) => this.open = true) { HelpMessage = "Open the Magitype Pilot controls." }))
@@ -90,7 +83,6 @@ public sealed partial class Plugin : IDalamudPlugin
             this.runTests.UnregisterFunc();
             this.listTests.UnregisterFunc();
 #endif
-            this.input.Dispose();
             throw new InvalidOperationException("Command /magitypepilot is already registered.");
         }
         framework.Update += this.Update;
@@ -103,7 +95,6 @@ public sealed partial class Plugin : IDalamudPlugin
     {
         lock (this.sync) this.pilot.Stop("Plugin unloaded.");
         this.framework.Update -= this.Update;
-        this.input.Dispose();
         this.directActions.Dispose();
         this.pluginInterface.UiBuilder.Draw -= this.Draw;
         this.pluginInterface.UiBuilder.OpenMainUi -= this.Open;
@@ -188,7 +179,7 @@ public sealed partial class Plugin : IDalamudPlugin
             }
             ImGui.Spacing();
             ImGui.TextColored(accent, "PLAY SETTINGS");
-            ImGui.TextUnformatted("Typing speed");
+            ImGui.TextUnformatted("Action pace");
             var speedIndex = this.config.SpeedIndex;
             var speedLabel = speedIndex switch { 0 => "Average · 50 WPM", 1 => "90 WPM", 2 => "Fast · 120 WPM", _ => "Ludicrous" };
             ImGui.SetNextItemWidth(-1);
@@ -199,9 +190,6 @@ public sealed partial class Plugin : IDalamudPlugin
             var requeue = this.config.AutoRequeue;
             if (ImGui.Checkbox("Automatically requeue", ref requeue)) { this.config.AutoRequeue = requeue; this.Save(); }
             ImGui.TextDisabled("Requeue begins after you return to the lobby.");
-            var mute = this.config.MuteTyping;
-            if (ImGui.Checkbox("Mute automated key sounds", ref mute)) { this.config.MuteTyping = mute; this.Save(); }
-            if (!this.input.QuietAudioAvailable) ImGui.TextWrapped("Typing sound muting is unavailable on this game build.");
             if (this.saveError != null) ImGui.TextWrapped(this.saveError);
             var debug = this.pilot.Debug;
             if (ImGui.Checkbox("Debug activity logging", ref debug))
@@ -211,8 +199,7 @@ public sealed partial class Plugin : IDalamudPlugin
             }
             if (debug)
             {
-                ImGui.TextUnformatted($"Suppressed sounds: {this.input.MutedSounds}");
-                ImGui.TextDisabled(this.directActions.Available ? "Experimental direct actions active." : "Direct actions unavailable; using typing.");
+                ImGui.TextDisabled(this.directActions.Available ? "Experimental direct actions active." : "Direct actions unavailable; retrying validation.");
             }
             ImGui.TextWrapped("Enabled when loaded. Disable to stop play; existing queues are not cancelled.");
         }

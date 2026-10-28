@@ -8,9 +8,6 @@ namespace MagitypePilot;
 
 internal sealed unsafe class Pilot(IGameGui gui, IClientState client, IObjectTable objects, IPluginLog log, GameInput input, DutyQueue queue, Configuration config)
 {
-    private string? phrase;
-    private readonly Dictionary<string, long> pending = new(StringComparer.Ordinal);
-    private int index;
     private long next;
     private uint territory;
     private uint instance;
@@ -21,8 +18,6 @@ internal sealed unsafe class Pilot(IGameGui gui, IClientState client, IObjectTab
     private long nextKeepAliveWarning;
     internal DirectActions? Direct { get; set; }
     private readonly Dictionary<string, long> bypassPending = new(StringComparer.Ordinal);
-    private readonly HashSet<string> bypassFallback = new(StringComparer.Ordinal);
-    private string? bypassPhrase;
     private long bypassStarted;
     public bool Debug { get; set; }
     public bool Armed { get; private set; } = true;
@@ -34,10 +29,10 @@ internal sealed unsafe class Pilot(IGameGui gui, IClientState client, IObjectTab
         {
             if (status == value) return;
             status = value;
-            if (!value.StartsWith("Typing ", StringComparison.Ordinal)) log.Information("Magitype Pilot: {Status}", value);
+            if (Debug) log.Information("Magitype Pilot: {Status}", value);
         }
     }
-    public int CharactersSent => index;
+    public int CharactersSent => 0;
 
     public void Arm()
     {
@@ -55,15 +50,10 @@ internal sealed unsafe class Pilot(IGameGui gui, IClientState client, IObjectTab
 
     private void Reset()
     {
-        phrase = null;
-        pending.Clear();
-        index = 0;
         hadGame = false;
         next = 0;
         stopTypingUntil = 0;
         bypassPending.Clear();
-        bypassFallback.Clear();
-        bypassPhrase = null;
         bypassStarted = 0;
     }
 
@@ -113,157 +103,52 @@ internal sealed unsafe class Pilot(IGameGui gui, IClientState client, IObjectTab
         if (Environment.TickCount64 < stopTypingUntil ||
             objects.LocalPlayer?.StatusList.Any(effect => effect.StatusId is 5346 or 5437) == true)
         {
-            bypassPhrase = null;
+            bypassStarted = 0;
             Status = "Stop-typing mechanic: waiting for the effect to finish.";
             return;
         }
         if (Environment.TickCount64 < next) return;
-        var words = ReadWords(out var ranks);
-        foreach (var entry in pending.ToArray())
-            if (CanRetrySubmitted(words.Contains(entry.Key), Environment.TickCount64 - entry.Value))
-                pending.Remove(entry.Key);
-        bypassFallback.RemoveWhere(word => !words.Contains(word));
-        foreach (var entry in bypassPending.ToArray())
+        if (Direct?.Available != true)
         {
-            if (!words.Contains(entry.Key)) bypassPending.Remove(entry.Key);
-            else if (ShouldFallback(Environment.TickCount64 - entry.Value))
-            {
-                bypassPending.Remove(entry.Key);
-                bypassFallback.Add(entry.Key);
-                log.Information("Magitype Pilot: target unchanged after bypass; returning to typing.");
-            }
-        }
-        var eligible = EligibleWords(words, pending.Keys.Concat(bypassPending.Keys));
-        var priority = eligible.FirstOrDefault();
-        if (phrase == null && priority != null && !bypassFallback.Contains(priority) && Direct != null && input.ReadText() == string.Empty)
-        {
-            if (bypassPhrase != priority)
-            {
-                bypassPhrase = null;
-                if (Direct.TryResolve(priority, gui, objects, out _, out _))
-                {
-                    bypassPhrase = priority;
-                    bypassStarted = Environment.TickCount64;
-                }
-            }
-            if (bypassPhrase == priority)
-            {
-                var waitMs = BypassWait(priority.Length, config.TypingDelay);
-                if (Environment.TickCount64 - bypassStarted < waitMs)
-                {
-                    Status = "Preparing target at the selected typing speed.";
-                    next = Environment.TickCount64 + Math.Min(100, Math.Max(1, config.TypingDelay));
-                    return;
-                }
-                bypassPhrase = null;
-                if (Direct.TryResolve(priority, gui, objects, out var director, out var target))
-                {
-                    var sent = Direct.Dispatch(director, target, out var attempted);
-                    if (attempted)
-                    {
-                        bypassPending[priority] = Environment.TickCount64;
-                        if (sent) input.RecordBypass();
-                        log.Information("Magitype Pilot bypass: client result={Result}; waiting for the phrase to change.", sent);
-                        Status = sent ? "Bypass dispatched; waiting for target change." : "Bypass unconfirmed; waiting for target change.";
-                        return;
-                    }
-                }
-            }
-        }
-        else bypassPhrase = null;
-        if (phrase != null && priority != null && phrase != priority && ranks.GetValueOrDefault(priority, int.MaxValue) < ranks.GetValueOrDefault(phrase, int.MaxValue) &&
-            (index == 0 ? input.ReadText() == string.Empty : input.ClearOwnedText(phrase[..index])))
-        {
-            phrase = null;
-            index = 0;
-            log.Information("Magitype Pilot: switching to a higher-priority target.");
-        }
-        if (phrase == null)
-        {
-            var text = input.ReadText();
-            if (text == null)
-            {
-                Status = "Waiting for the Magitype text input.";
-                next = Environment.TickCount64 + 100;
-                return;
-            }
-            if (text.Length != 0)
-            {
-                phrase = FindResumable(eligible, text, null);
-                if (phrase != null)
-                {
-                    index = text.Length;
-                    log.Information("Magitype Pilot: resuming a matching partial phrase at {Count} characters.", index);
-                }
-                else
-                {
-                    if (input.TrySubmit(text, out var recovery))
-                    {
-                        log.Information("Magitype Pilot: submitted unmatched input for recovery. {Result}", recovery);
-                        next = Environment.TickCount64 + SubmissionDelay(input.ReadText());
-                    }
-                    else
-                    {
-                        Status = "Recovering the input field.";
-                        next = Environment.TickCount64 + 100;
-                    }
-                    return;
-                }
-            }
-            else
-            {
-            phrase = priority;
-            if (phrase == null)
-            {
-                Status = pending.Count == 0 ? "Enabled; waiting for a visible phrase." : "Waiting for a new phrase.";
-                next = 0;
-                return;
-            }
-            index = 0;
-            log.Information("Magitype Pilot: selected {Kind} phrase with {Length} characters; {Count} candidates.",
-                config.Priorities[ranks[phrase]], phrase.Length, words.Length);
-            }
-        }
-        if (!words.Contains(phrase))
-        {
-            var cleared = index == 0 ? input.ReadText() == string.Empty : input.ClearOwnedText(phrase[..index]);
-            phrase = null;
-            index = 0;
-            Status = cleared ? "Phrase disappeared; cleared the unfinished input." : "Phrase disappeared; waiting for the input box to clear.";
-            next = cleared ? 0 : Environment.TickCount64 + 100;
+            Status = "Direct actions unavailable; retrying validation.";
+            next = Environment.TickCount64 + 500;
             return;
         }
-        if (index < phrase.Length)
+        var now = Environment.TickCount64;
+        var words = ReadWords(out _);
+        foreach (var entry in bypassPending.ToArray())
+            if (!words.Contains(entry.Key) || now >= entry.Value) bypassPending.Remove(entry.Key);
+        var eligible = EligibleWords(words, bypassPending.Keys);
+        string? selected = null;
+        nint director = 0;
+        nint target = 0;
+        foreach (var word in eligible)
         {
-            if (!input.TryType(phrase[..index], phrase[..(index + 1)], out var reason))
-            {
-                phrase = null;
-                index = 0;
-                Status = reason;
-                next = Environment.TickCount64 + 100;
-                return;
-            }
-            index++;
-            var pace = config.Speed == TypingSpeed.NinetyWpm ? "90 WPM" : config.Speed?.ToString().ToLowerInvariant();
-            Status = $"Typing {index}/{phrase.Length} characters ({pace}).";
-            next = index == phrase.Length ? 0 : Environment.TickCount64 + config.TypingDelay;
+            if (!Direct.TryResolve(word, gui, objects, out director, out target)) continue;
+            selected = word;
+            break;
         }
-        else
+        if (selected == null)
         {
-            if (!input.TrySubmit(phrase, out var reason))
-            {
-                phrase = null;
-                index = 0;
-                Status = reason;
-                next = Environment.TickCount64 + 100;
-                return;
-            }
-            log.Information("Magitype Pilot: {Count} characters confirmed. {Result}", index, reason);
-            pending[phrase] = Environment.TickCount64;
-            phrase = null;
-            next = Environment.TickCount64 + SubmissionDelay(input.ReadText());
-            Status = "Submitted; waiting for the next phrase.";
+            if (words.Length == 0) bypassStarted = 0;
+            Status = words.Length == 0 ? "Enabled; waiting for a visible phrase." : "Waiting for a clear direct-action target.";
+            next = now + 100;
+            return;
         }
+        bypassStarted = PaceStart(bypassStarted, now, false);
+        if (now - bypassStarted < BypassWait(selected.Length, config.TypingDelay))
+        {
+            Status = "Preparing target at the selected typing speed.";
+            next = now + Math.Min(100, Math.Max(1, config.TypingDelay));
+            return;
+        }
+        var sent = Direct.Dispatch(director, target, out var attempted);
+        bypassStarted = PaceStart(bypassStarted, now, sent);
+        bypassPending[selected] = Environment.TickCount64 + RetryDelay(attempted, config.Speed == TypingSpeed.Ludicrous);
+        if (sent) input.RecordBypass();
+        if (Debug && attempted)
+            log.Information("Magitype Pilot direct action: client result={Result}; awaiting target update.", sent);
+        Status = sent ? "Direct action dispatched; awaiting target update." : "Direct action unavailable; retrying.";
     }
 
     private bool Ready()
@@ -342,12 +227,11 @@ internal sealed unsafe class Pilot(IGameGui gui, IClientState client, IObjectTab
         targets.OrderBy(t => t.Rank).ThenBy(t => t.Remaining).ThenByDescending(t => t.Y).Select(t => t.Word).ToArray();
 
     internal static long BypassWait(int length, int delay) => (long)Math.Max(0, length - 1) * delay;
-    internal static bool ShouldFallback(long elapsed) => elapsed >= 5000;
+    internal static long PaceStart(long started, long now, bool sent) => sent ? 0 : started == 0 ? now : started;
+    // shortcut: allow the UI to catch up after a request; replace with explicit acceptance if exposed.
+    internal static int RetryDelay(bool attempted, bool ludicrous) => attempted ? 250 : ludicrous ? 0 : 100;
     internal static bool ShouldKeepAlive(bool loggedIn, bool pvp, uint territory, long now, long next) =>
         loggedIn && !pvp && territory == 1359 && now >= next;
-    internal static int SubmissionDelay(string? input) => input == string.Empty ? 0 : 100;
-    // shortcut: 250 ms permits observed UI updates; replace with explicit acceptance if exposed.
-    internal static bool CanRetrySubmitted(bool stillVisible, long elapsed) => !stillVisible || elapsed >= 250;
     internal static string[] EligibleWords(IEnumerable<string> words, IEnumerable<string> pending) => words.Except(pending).ToArray();
 
     internal static int InterruptIndex(IReadOnlyList<float> centers, float casterX)
@@ -382,8 +266,6 @@ internal sealed unsafe class Pilot(IGameGui gui, IClientState client, IObjectTab
     // An observed long Tankbuster completed despite boss damage; preserve available barrier reinforcement.
     internal static bool ShouldPrioritizeCast(bool interrupt, uint action, float remaining, bool actionableBarrier) =>
         IsUrgentCast(interrupt, remaining) && (interrupt || action != 49699 || !actionableBarrier);
-    internal static string? FindResumable(IEnumerable<string> words, string text, string? submitted) =>
-        text.Length == 0 ? null : words.FirstOrDefault(word => word != submitted && word.StartsWith(text, StringComparison.OrdinalIgnoreCase));
     internal static bool IsStopCast(bool casting, uint action) => casting && action is 49529 or 49532 or 49702;
     internal static bool ShouldPrepareStop(bool casting, uint action, float elapsed, float total) =>
         IsStopCast(casting, action) && (!float.IsFinite(elapsed) || !float.IsFinite(total) || elapsed < 0 || total <= 0 || elapsed / total >= 0.5f);

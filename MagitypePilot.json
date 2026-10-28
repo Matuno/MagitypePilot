@@ -1,8 +1,8 @@
 {
   "Author": "Matuno",
   "Name": "Magitype Pilot",
-  "Punchline": "Automate typing in Magitype.",
-  "Description": "Experimental Magitype automation with direct actions, typing fallback, configurable priorities, speed, automatic exit and requeue. Cast and barrier matching are experimental. The logo is AI-generated.",
+  "Punchline": "Automate Magitype with direct actions.",
+  "Description": "Experimental Magitype automation with direct actions, retries, configurable priorities, speed, automatic exit and requeue. Cast and barrier matching are experimental. The logo is AI-generated.",
   "RepoUrl": "https://github.com/Matuno/MagitypePilot",
   "IconUrl": "https://raw.githubusercontent.com/Matuno/DalamudPlugins/main/plugins/MagitypePilot/icon.png",
   "ApplicableVersion": "any",

@@ -9,9 +9,23 @@ namespace MagitypePilot;
 
 internal sealed unsafe partial class DirectActions(ISigScanner scanner, IPluginLog log, IClientState client, IObjectTable objects) : IDisposable
 {
-    private bool attemptedStart;
+    private long nextStart;
+    private long nextWarning;
     private bool debug;
     public bool Available { get; private set; }
+    internal int ResolveAttempts { get; private set; }
+    internal int ResolveMatches { get; private set; }
+    internal int ActionUnavailable { get; private set; }
+    internal int ActionsAttempted { get; private set; }
+    internal int DuplicateLabels { get; private set; }
+    internal int ProjectFailures { get; private set; }
+    internal int LabelMismatches { get; private set; }
+    internal int UnmatchedTargets { get; private set; }
+    internal int AmbiguousTargets { get; private set; }
+    internal float LastLabelX { get; private set; }
+    internal float LastObjectX { get; private set; }
+    internal int LastLabelCount { get; private set; }
+    internal int LastLabelIndex { get; private set; }
 
     partial void StartDiagnostics();
     partial void StopDiagnostics();
@@ -34,8 +48,9 @@ internal sealed unsafe partial class DirectActions(ISigScanner scanner, IPluginL
     public bool Start()
     {
         if (Available) return true;
-        if (attemptedStart) return false;
-        attemptedStart = true;
+        var now = Environment.TickCount64;
+        if (now < nextStart) return false;
+        nextStart = now + 5000;
         try
         {
             var image = scanner.Module.BaseAddress;
@@ -60,13 +75,18 @@ internal sealed unsafe partial class DirectActions(ISigScanner scanner, IPluginL
         }
         catch (Exception ex)
         {
-            log.Warning(ex, "Magitype direct actions unavailable; using typing.");
+            if (now >= nextWarning)
+            {
+                nextWarning = now + 30000;
+                log.Warning(ex, "Magitype direct actions unavailable; retrying validation.");
+            }
             return false;
         }
     }
 
     public bool TryResolve(string phrase, IGameGui gui, IObjectTable objects, out nint directorAddress, out nint targetAddress)
     {
+        if (debug) ResolveAttempts++;
         directorAddress = targetAddress = 0;
         if (!Available) return false;
         if (client.TerritoryType != 1359) return false;
@@ -77,6 +97,7 @@ internal sealed unsafe partial class DirectActions(ISigScanner scanner, IPluginL
         var centers = new List<float>();
         var selected = -1;
         var selectedBarrier = false;
+        var barrierLabels = 0;
         for (var i = 0; i < u->NodeListCount; i++)
         {
             var node = u->NodeList[i];
@@ -92,12 +113,14 @@ internal sealed unsafe partial class DirectActions(ISigScanner scanner, IPluginL
                 var value = Pilot.ReadText(((AtkTextNode*)text)->NodeText.StringPtr.Value);
                 var center = node->ScreenX + node->Width / 2f;
                 if (!Pilot.IsSafePhrase(value) || !float.IsFinite(center)) continue;
+                var color = ((AtkTextNode*)text)->TextColor;
+                var barrier = Pilot.IsBarrierLabel(true, color.R, color.G, color.B);
+                if (barrier) barrierLabels++;
                 if (value == phrase)
                 {
-                    if (selected >= 0) return false;
+                    if (selected >= 0) { if (debug) DuplicateLabels++; return false; }
                     selected = centers.Count;
-                    var color = ((AtkTextNode*)text)->TextColor;
-                    selectedBarrier = Pilot.IsBarrierLabel(true, color.R, color.G, color.B);
+                    selectedBarrier = barrier;
                 }
                 centers.Add(center);
             }
@@ -112,6 +135,8 @@ internal sealed unsafe partial class DirectActions(ISigScanner scanner, IPluginL
         var best = float.PositiveInfinity;
         var second = float.PositiveInfinity;
         nint target = 0;
+        nint soleCandidate = 0;
+        var candidates = 0;
         foreach (var obj in objects)
         {
             if (obj.ObjectKind != ObjectKind.BattleNpc || !obj.IsTargetable || obj.IsDead || !CandidateKindMatches(selectedBarrier, obj.BaseId)) continue;
@@ -124,24 +149,32 @@ internal sealed unsafe partial class DirectActions(ISigScanner scanner, IPluginL
                 node = *(byte**)(node + (obj.EntityId < id ? 0 : 0x10));
             }
             if (node == null || node[0x19] != 0 || steps > 128 || *(uint*)(node + 0x1c) != obj.EntityId) continue;
+            soleCandidate = obj.Address;
+            candidates++;
             var distance = 0f;
             if (!selectedBarrier)
             {
-                if (!gui.WorldToScreen(obj.Position, out var pos)) continue;
+                if (!gui.WorldToScreen(obj.Position, out var pos)) { if (debug) ProjectFailures++; continue; }
                 var label = Pilot.InterruptIndex(centers, pos.X);
-                if (label != selected) continue;
+                if (debug) { LastLabelX = centers[selected]; LastObjectX = pos.X; LastLabelCount = centers.Count; LastLabelIndex = label; }
+                if (label != selected) { if (debug) LabelMismatches++; continue; }
                 distance = MathF.Abs(pos.X - centers[selected]);
             }
             if (distance < best) { second = best; best = distance; target = obj.Address; }
             else if (distance < second) second = distance;
         }
-        if (target == 0 || best > 45 || second - best < 20) return false;
+        if (CanUseSoleTarget(selectedBarrier ? barrierLabels : centers.Count - barrierLabels, candidates))
+        { target = soleCandidate; best = 0; second = float.PositiveInfinity; }
+        if (target == 0 || best > 45) { if (debug) UnmatchedTargets++; return false; }
+        if (second - best < 20) { if (debug) AmbiguousTargets++; return false; }
+        if (debug) ResolveMatches++;
         directorAddress = (nint)director;
         targetAddress = target;
         return true;
     }
 
     internal static bool CandidateKindMatches(bool barrier, uint baseId) => barrier == (baseId == 20079);
+    internal static bool CanUseSoleTarget(int labels, int candidates) => labels == 1 && candidates == 1;
 
     internal static uint ExtraArgument(uint entity, uint word, uint counter, uint sequence) =>
         unchecked(entity - word + counter + sequence + 1u);
@@ -181,10 +214,15 @@ internal sealed unsafe partial class DirectActions(ISigScanner scanner, IPluginL
         var action = ActionFor(enemy, altered);
         var targetId = (ulong)native->GetGameObjectId();
         var extra = ExtraArgument(native->EntityId, *(uint*)(node + 0x28), *(uint*)(d + 0x1fb8), *(uint*)(node + 0x24));
-        if (manager->GetActionStatus(ActionType.Action, action, targetId) != 0) return false;
+        if (manager->GetActionStatus(ActionType.Action, action, targetId) != 0)
+        {
+            if (debug) ActionUnavailable++;
+            return false;
+        }
         var beforeSequence = manager->LastUsedActionSequence;
         BeforeAction(action, targetId, beforeSequence);
         attempted = true;
+        if (debug) ActionsAttempted++;
         var result = manager->UseAction(ActionType.Action, action, targetId, extra);
         var sequence = manager->LastUsedActionSequence;
         AfterAction(action, targetId, sequence, sequence != beforeSequence);

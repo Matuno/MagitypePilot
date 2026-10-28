@@ -1,61 +1,13 @@
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using Dalamud.Plugin.Services;
-using Dalamud.Hooking;
-using FFXIVClientStructs.FFXIV.Client.Sound;
-using FFXIVClientStructs.FFXIV.Client.UI;
-using InteropGenerator.Runtime;
 using FFXIVClientStructs.FFXIV.Client.UI.Agent;
 using FFXIVClientStructs.FFXIV.Client.UI.Misc;
-using FFXIVClientStructs.FFXIV.Component.GUI;
 
 namespace MagitypePilot;
 
-internal sealed unsafe class GameInput : IDisposable
+internal sealed unsafe class GameInput(IAgentLifecycle agents, ISigScanner scanner)
 {
-    private readonly IGameGui gui;
-    private readonly IAgentLifecycle agents;
-    private readonly ISigScanner scanner;
-    private readonly Configuration config;
-    private Hook<UIGlobals.Delegates.PlaySoundEffect>? soundHook;
-    private Hook<SoundManager.Delegates.PlaySystemSound>? systemSoundHook;
-    [ThreadStatic] private static bool quietTyping;
-    private int mutedSounds;
-    internal int MutedSounds => Volatile.Read(ref mutedSounds);
-    internal bool QuietAudioAvailable => soundHook != null && systemSoundHook != null;
-
-    public GameInput(IGameGui gui, IAgentLifecycle agents, ISigScanner scanner, IGameInteropProvider interop, Configuration config, IPluginLog log)
-    {
-        this.gui = gui; this.agents = agents; this.scanner = scanner; this.config = config;
-        try
-        {
-            soundHook = interop.HookFromAddress<UIGlobals.Delegates.PlaySoundEffect>(UIGlobals.Addresses.PlaySoundEffect.Value, OnSound);
-            systemSoundHook = interop.HookFromAddress<SoundManager.Delegates.PlaySystemSound>(SoundManager.Addresses.PlaySystemSound.Value, OnSystemSound);
-            soundHook.Enable();
-            systemSoundHook.Enable();
-        }
-        catch (Exception ex)
-        {
-            soundHook?.Dispose(); systemSoundHook?.Dispose(); soundHook = null; systemSoundHook = null;
-            log.Warning(ex, "Magitype typing sound muting is unavailable.");
-        }
-    }
-
-    private void OnSound(uint id, SoundData** pad, SoundData** data, byte a4)
-    {
-        if (quietTyping && pad == null && data == null) { Interlocked.Increment(ref mutedSounds); return; }
-        soundHook!.Original(id, pad, data, a4);
-    }
-
-    private SoundData* OnSystemSound(SoundManager* manager, CStringPointer path, float volume, uint number,
-        uint fade, bool autoRelease, SoundVolumeCategory category)
-    {
-        if (quietTyping) { Interlocked.Increment(ref mutedSounds); volume = 0; }
-        return systemSoundHook!.Original(manager, path, volume, number, fade, autoRelease, category);
-    }
-
-    public void Dispose() { soundHook?.Dispose(); systemSoundHook?.Dispose(); }
-
     // Accept these offsets only with the exact analyzed KTG update body.
     private const int ActivityTableRva = 0x2200680;
     private const int ActivityUpdateRva = 0x10FACC0;
@@ -76,30 +28,6 @@ internal sealed unsafe class GameInput : IDisposable
 
     internal readonly record struct ActivityStatus(bool Available, string Reason, float? IdleSeconds,
         float? SinceDifferentKeySeconds, ushort? Repeats, int RecordedInputs, int KeepAliveUpdates);
-
-    private AtkComponentTextInput* GetInput()
-    {
-        var addon = gui.GetAddonByName<AtkUnitBase>("KTGInput", 1);
-        if (addon == null || !addon->IsVisible || !addon->IsReady) return null;
-        var component = addon->GetComponentByNodeId(7);
-        if (component == null || component->GetComponentType() != ComponentType.TextInput) return null;
-        var input = (AtkComponentTextInput*)component;
-        return input->OwnerAddon == addon && input->Enabled && input->Callback != null ? input : null;
-    }
-
-    public string? ReadText()
-    {
-        var input = GetInput();
-        return input == null ? null : Pilot.ReadText(input->RawString.StringPtr.Value);
-    }
-
-    public bool ClearOwnedText(string expected)
-    {
-        var input = GetInput();
-        if (input == null || !CanClear(Pilot.ReadText(input->RawString.StringPtr.Value), expected)) return false;
-        input->SetText(string.Empty);
-        return Matches(ReadText(), string.Empty);
-    }
 
     private bool TryGetActivity(out ActivityCounters* counters, out string reason)
     {
@@ -132,60 +60,26 @@ internal sealed unsafe class GameInput : IDisposable
     // The caller limits this to an enabled pilot inside Magitype.
     internal bool KeepAlive()
     {
+        if (!ResetActivity()) return false;
+        keepAliveUpdates++;
+        return true;
+    }
+
+    internal void RecordBypass()
+    {
+        if (ResetActivity()) activityUpdates++;
+    }
+
+    private bool ResetActivity()
+    {
         if (!TryGetActivity(out var counters, out _)) return false;
         counters->Idle = counters->SinceDifferentKey = 0;
         var shared = InputTimerModule.Instance();
         if (shared == null) return false;
         shared->AfkTimer = shared->ContentInputTimer = shared->InputTimer = 0;
-        keepAliveUpdates++;
         return true;
     }
 
-    private void RecordAcceptedInput()
-    {
-        if (GetInput() == null || !TryGetActivity(out var counters, out _)) return;
-        counters->Idle = counters->SinceDifferentKey = 0;
-        var shared = InputTimerModule.Instance();
-        if (shared != null) shared->AfkTimer = shared->ContentInputTimer = shared->InputTimer = 0;
-        activityUpdates++;
-    }
-
-    internal void RecordBypass() => RecordAcceptedInput();
-
-    public bool TryType(string expected, string next, out string reason)
-    {
-        if (!TryGetActivity(out _, out reason)) return false;
-        var input = GetInput();
-        if (input == null) { reason = "Waiting for the Magitype text input."; return false; }
-        if (!Matches(Pilot.ReadText(input->RawString.StringPtr.Value), expected))
-        { reason = "Input changed; waiting for the input box to clear."; return false; }
-        quietTyping = config.MuteTyping && QuietAudioAvailable;
-        try { input->SetText(next); }
-        finally { quietTyping = false; }
-        if (!Matches(ReadText(), next))
-        { reason = "Text entry was not confirmed; waiting for the input box to clear."; return false; }
-        RecordAcceptedInput();
-        reason = "Text entry confirmed.";
-        return true;
-    }
-
-    public bool TrySubmit(string expected, out string reason)
-    {
-        if (!TryGetActivity(out _, out reason)) return false;
-        var input = GetInput();
-        if (input == null || !Matches(Pilot.ReadText(input->RawString.StringPtr.Value), expected))
-        { reason = "Input changed before submission; waiting for the input box to clear."; return false; }
-        var result = input->Callback(input->OwnerAddon, InputCallbackType.Enter,
-            input->RawString.StringPtr, input->EvaluatedString.StringPtr, input->CallbackEventKind);
-        // The native callback returns the cleanup action to its caller; it does not clear the field itself.
-        if (result == InputCallbackResult.ClearText && GetInput() == input) input->SetText(string.Empty);
-        RecordAcceptedInput();
-        reason = $"Native submission dispatched ({result}); awaiting target change.";
-        return true;
-    }
-
-    internal static bool Matches(string? actual, string expected) => string.Equals(actual, expected, StringComparison.OrdinalIgnoreCase);
-    internal static bool CanClear(string? actual, string expected) => expected.Length > 0 && string.Equals(actual, expected, StringComparison.Ordinal);
     internal static bool ValidCounters(float idle, float different, ushort key, ushort repeats) =>
         float.IsFinite(idle) && float.IsFinite(different) && idle is >= 0 and <= 86400 &&
         different is >= 0 and <= 86400 && key < 160 && repeats <= 10;
