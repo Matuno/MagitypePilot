@@ -2,7 +2,7 @@
   "Author": "Matuno",
   "Name": "Magitype Pilot",
   "Punchline": "Automate typing in Magitype.",
-  "Description": "Experimental Magitype automation that types visible phrases, prioritizes nearby targets and pauses for Cursed Gaze. Interruptible-target priority is not yet implemented. The logo is AI-generated.",
+  "Description": "Experimental Magitype automation that types visible phrases, prioritizes nearby and interruptible targets, and pauses for stop-typing mechanics. Interrupt matching and pause timing are experimental. The logo is AI-generated.",
   "RepoUrl": "https://github.com/Matuno/MagitypePilot",
   "IconUrl": "https://raw.githubusercontent.com/Matuno/DalamudPlugins/main/plugins/MagitypePilot/icon.png",
   "ApplicableVersion": "any",

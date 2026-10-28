@@ -1,14 +1,61 @@
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using Dalamud.Plugin.Services;
+using Dalamud.Hooking;
+using FFXIVClientStructs.FFXIV.Client.Sound;
+using FFXIVClientStructs.FFXIV.Client.UI;
+using InteropGenerator.Runtime;
 using FFXIVClientStructs.FFXIV.Client.UI.Agent;
 using FFXIVClientStructs.FFXIV.Client.UI.Misc;
 using FFXIVClientStructs.FFXIV.Component.GUI;
 
 namespace MagitypePilot;
 
-internal sealed unsafe class GameInput(IGameGui gui, IAgentLifecycle agents, ISigScanner scanner)
+internal sealed unsafe class GameInput : IDisposable
 {
+    private readonly IGameGui gui;
+    private readonly IAgentLifecycle agents;
+    private readonly ISigScanner scanner;
+    private readonly Configuration config;
+    private Hook<UIGlobals.Delegates.PlaySoundEffect>? soundHook;
+    private Hook<SoundManager.Delegates.PlaySystemSound>? systemSoundHook;
+    [ThreadStatic] private static bool quietTyping;
+    private int mutedSounds;
+    internal int MutedSounds => Volatile.Read(ref mutedSounds);
+    internal bool QuietAudioAvailable => soundHook != null && systemSoundHook != null;
+
+    public GameInput(IGameGui gui, IAgentLifecycle agents, ISigScanner scanner, IGameInteropProvider interop, Configuration config, IPluginLog log)
+    {
+        this.gui = gui; this.agents = agents; this.scanner = scanner; this.config = config;
+        try
+        {
+            soundHook = interop.HookFromAddress<UIGlobals.Delegates.PlaySoundEffect>(UIGlobals.Addresses.PlaySoundEffect.Value, OnSound);
+            systemSoundHook = interop.HookFromAddress<SoundManager.Delegates.PlaySystemSound>(SoundManager.Addresses.PlaySystemSound.Value, OnSystemSound);
+            soundHook.Enable();
+            systemSoundHook.Enable();
+        }
+        catch (Exception ex)
+        {
+            soundHook?.Dispose(); systemSoundHook?.Dispose(); soundHook = null; systemSoundHook = null;
+            log.Warning(ex, "Magitype typing sound muting is unavailable.");
+        }
+    }
+
+    private void OnSound(uint id, SoundData** pad, SoundData** data, byte a4)
+    {
+        if (quietTyping && pad == null && data == null) { Interlocked.Increment(ref mutedSounds); return; }
+        soundHook!.Original(id, pad, data, a4);
+    }
+
+    private SoundData* OnSystemSound(SoundManager* manager, CStringPointer path, float volume, uint number,
+        uint fade, bool autoRelease, SoundVolumeCategory category)
+    {
+        if (quietTyping) { Interlocked.Increment(ref mutedSounds); volume = 0; }
+        return systemSoundHook!.Original(manager, path, volume, number, fade, autoRelease, category);
+    }
+
+    public void Dispose() { soundHook?.Dispose(); systemSoundHook?.Dispose(); }
+
     // Accept these offsets only with the exact analyzed KTG update body.
     private const int ActivityTableRva = 0x2200680;
     private const int ActivityUpdateRva = 0x10FACC0;
@@ -97,7 +144,9 @@ internal sealed unsafe class GameInput(IGameGui gui, IAgentLifecycle agents, ISi
         if (input == null) { reason = "Waiting for the Magitype text input."; return false; }
         if (!Matches(Pilot.ReadText(input->RawString.StringPtr.Value), expected))
         { reason = "Input changed; waiting for the input box to clear."; return false; }
-        input->SetText(next);
+        quietTyping = config.MuteTyping && QuietAudioAvailable;
+        try { input->SetText(next); }
+        finally { quietTyping = false; }
         if (!Matches(ReadText(), next))
         { reason = "Text entry was not confirmed; waiting for the input box to clear."; return false; }
         RecordAcceptedInput();

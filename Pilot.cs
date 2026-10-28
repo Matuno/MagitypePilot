@@ -1,20 +1,23 @@
 using System.Text;
+using Dalamud.Game.ClientState.Objects.Enums;
 using Dalamud.Plugin.Services;
 using Dalamud.Game.ClientState.Objects.Types;
 using FFXIVClientStructs.FFXIV.Component.GUI;
 
 namespace MagitypePilot;
 
-internal sealed unsafe class Pilot(IGameGui gui, IClientState client, IObjectTable objects, IPluginLog log, GameInput input)
+internal sealed unsafe class Pilot(IGameGui gui, IClientState client, IObjectTable objects, IPluginLog log, GameInput input, DutyQueue queue, Configuration config)
 {
     private string? phrase;
-    private string? submitted;
+    private readonly Dictionary<string, long> pending = new(StringComparer.Ordinal);
     private int index;
     private long next;
     private uint territory;
     private uint instance;
     private bool hadGame;
     private long nextDebugLog;
+    private long stopTypingUntil;
+    private bool fastMode;
     public bool Debug { get; set; }
     public bool Armed { get; private set; } = true;
     private string status = "Enabled; waiting for Magitype.";
@@ -46,10 +49,13 @@ internal sealed unsafe class Pilot(IGameGui gui, IClientState client, IObjectTab
 
     private void Reset()
     {
-        phrase = submitted = null;
+        phrase = null;
+        pending.Clear();
         index = 0;
         hadGame = false;
         next = 0;
+        stopTypingUntil = 0;
+        fastMode = false;
     }
 
     public void Update()
@@ -61,7 +67,7 @@ internal sealed unsafe class Pilot(IGameGui gui, IClientState client, IObjectTab
         }
         if (!Armed) return;
         var wait = !client.IsLoggedIn ? "Waiting for login." : client.IsPvP ? "Waiting: PvP is active." :
-            !Ready() ? "Waiting for Magitype UI." : null;
+            !Ready() ? queue.Update() ?? "Waiting for Magitype UI." : null;
         if (wait != null)
         {
             if (hadGame) Reset();
@@ -81,47 +87,92 @@ internal sealed unsafe class Pilot(IGameGui gui, IClientState client, IObjectTab
             instance = client.Instance;
             log.Information("Magitype Pilot: game UI ready; starting observation.");
             hadGame = true;
-            next = Environment.TickCount64 + 500;
         }
-        // Magitype's Cursed Gaze punishes typing until its cast ends.
-        if (objects.Any(obj => obj is IBattleChara b && IsGaze(b.IsCasting, b.CastActionId)))
+        // Observed penalties arrive after the cast bar disappears.
+        if (objects.Any(obj => obj is IBattleChara b && ShouldPrepareStop(b.IsCasting, b.CastActionId, b.CurrentCastTime, b.TotalCastTime)))
+            stopTypingUntil = Environment.TickCount64 + 3000;
+        if (Environment.TickCount64 < stopTypingUntil ||
+            objects.LocalPlayer?.StatusList.Any(effect => effect.StatusId is 5346 or 5437) == true)
         {
-            Status = "Cursed Gaze: pausing typing until the cast ends.";
+            Status = "Stop-typing mechanic: waiting for the effect to finish.";
             return;
         }
-        if (Environment.TickCount64 < next) return;
-        var words = ReadWords();
-        if (submitted != null && !words.Contains(submitted))
+        var fast = config.LudicrousSpeed || objects.Any(obj => obj is IBattleChara b && b.ObjectKind == ObjectKind.BattleNpc &&
+            IsDangerousCast(b.IsCasting, b.CurrentCastTime, b.TotalCastTime));
+        if (fast != fastMode)
         {
-            log.Information("Magitype Pilot: submitted phrase is no longer visible; acceptance is not confirmed.");
-            submitted = null;
+            if (fast) next = Math.Min(next, Environment.TickCount64 + (config.LudicrousSpeed ? 0 : 25));
+            fastMode = fast;
+            log.Information("Magitype Pilot: typing pace changed to {Pace}.", fast ? "fast" : "normal");
+        }
+        if (config.LudicrousSpeed) next = 0;
+        if (Environment.TickCount64 < next) return;
+        var words = ReadWords(out var ranks);
+        foreach (var entry in pending.ToArray())
+            if (CanRetrySubmitted(words.Contains(entry.Key), Environment.TickCount64 - entry.Value))
+                pending.Remove(entry.Key);
+        var eligible = EligibleWords(words, pending.Keys);
+        var priority = eligible.FirstOrDefault();
+        if (phrase != null && priority != null && phrase != priority && ranks.GetValueOrDefault(priority, int.MaxValue) < ranks.GetValueOrDefault(phrase, int.MaxValue) &&
+            (index == 0 ? input.ReadText() == string.Empty : input.ClearOwnedText(phrase[..index])))
+        {
+            phrase = null;
+            index = 0;
+            log.Information("Magitype Pilot: switching to a higher-priority target.");
         }
         if (phrase == null)
         {
             var text = input.ReadText();
-            if (text == null || text.Length != 0)
+            if (text == null)
             {
-                Status = text == null ? "Waiting for the Magitype text input." : "Waiting for the input box to clear.";
+                Status = "Waiting for the Magitype text input.";
                 next = Environment.TickCount64 + 100;
                 return;
             }
-            phrase = words.FirstOrDefault(word => word != submitted && IsSafePhrase(word));
+            if (text.Length != 0)
+            {
+                phrase = FindResumable(eligible, text, null);
+                if (phrase != null)
+                {
+                    index = text.Length;
+                    log.Information("Magitype Pilot: resuming a matching partial phrase at {Count} characters.", index);
+                }
+                else
+                {
+                    if (input.TrySubmit(text, out var recovery))
+                    {
+                        log.Information("Magitype Pilot: submitted unmatched input for recovery. {Result}", recovery);
+                        next = input.ReadText() == string.Empty ? 0 : Environment.TickCount64 + 100;
+                    }
+                    else
+                    {
+                        Status = "Recovering the input field.";
+                        next = Environment.TickCount64 + 100;
+                    }
+                    return;
+                }
+            }
+            else
+            {
+            phrase = priority;
             if (phrase == null)
             {
-                Status = submitted == null ? "Enabled; waiting for a visible phrase." : "Waiting for a new phrase.";
-                next = Environment.TickCount64 + 100;
+                Status = pending.Count == 0 ? "Enabled; waiting for a visible phrase." : "Waiting for a new phrase.";
+                next = 0;
                 return;
             }
             index = 0;
-            log.Information("Magitype Pilot: selected visible phrase with {Length} characters; {Count} candidates.", phrase.Length, words.Length);
+            log.Information("Magitype Pilot: selected {Kind} phrase with {Length} characters; {Count} candidates.",
+                phrase == priority ? "prioritized" : "nearby", phrase.Length, words.Length);
+            }
         }
         if (!words.Contains(phrase))
         {
-            var cleared = input.ClearOwnedText(phrase[..index]);
+            var cleared = index == 0 ? input.ReadText() == string.Empty : input.ClearOwnedText(phrase[..index]);
             phrase = null;
             index = 0;
             Status = cleared ? "Phrase disappeared; cleared the unfinished input." : "Phrase disappeared; waiting for the input box to clear.";
-            next = Environment.TickCount64 + 100;
+            next = cleared ? 0 : Environment.TickCount64 + 100;
             return;
         }
         if (index < phrase.Length)
@@ -135,8 +186,8 @@ internal sealed unsafe class Pilot(IGameGui gui, IClientState client, IObjectTab
                 return;
             }
             index++;
-            Status = $"Typing {index}/{phrase.Length} characters.";
-            next = Environment.TickCount64 + 35;
+            Status = $"Typing {index}/{phrase.Length} characters ({(fast ? "fast" : "normal")}).";
+            next = index == phrase.Length ? 0 : Environment.TickCount64 + (config.LudicrousSpeed ? 0 : fast ? 25 : 100);
         }
         else
         {
@@ -149,9 +200,9 @@ internal sealed unsafe class Pilot(IGameGui gui, IClientState client, IObjectTab
                 return;
             }
             log.Information("Magitype Pilot: {Count} characters confirmed. {Result}", index, reason);
-            submitted = phrase;
+            pending[phrase] = Environment.TickCount64;
             phrase = null;
-            next = Environment.TickCount64 + 1000;
+            next = 0;
             Status = "Submitted; waiting for the next phrase.";
         }
     }
@@ -165,13 +216,14 @@ internal sealed unsafe class Pilot(IGameGui gui, IClientState client, IObjectTab
 
     public GameInput.ActivityStatus CaptureActivity() => input.CaptureActivity();
 
-    private string[] ReadWords()
+    private string[] ReadWords(out Dictionary<string, int> ranks)
     {
+        ranks = new(StringComparer.Ordinal);
         var addon = gui.GetAddonByName<AtkUnitBase>("KTGEWord", 1);
         if (addon == null) return [];
         var u = &addon->UldManager;
         if (u->NodeList == null || u->NodeListCount > 512) return [];
-        var words = new List<(string Word, float Y)>();
+        var words = new List<(string Word, float Y, float CenterX)>();
         for (var i = 0; i < u->NodeListCount; i++)
         {
             var node = u->NodeList[i];
@@ -185,10 +237,52 @@ internal sealed unsafe class Pilot(IGameGui gui, IClientState client, IObjectTab
                 var text = nested->NodeList[j];
                 if (text == null || text->NodeId != 20 || text->Type != NodeType.Text || !text->IsVisible()) continue;
                 var value = ReadText(((AtkTextNode*)text)->NodeText.StringPtr.Value);
-                if (IsSafePhrase(value) && float.IsFinite(node->ScreenY)) words.Add((value!, node->ScreenY));
+                if (IsSafePhrase(value) && float.IsFinite(node->ScreenY) && float.IsFinite(node->ScreenX))
+                    words.Add((value!, node->ScreenY, node->ScreenX + node->Width / 2f));
             }
         }
-        return OrderWords(words);
+        var targets = words.Select(word => (word.Word, word.Y, word.CenterX,
+            Rank: config.Rank(TargetPriority.Closest), Remaining: float.PositiveInfinity)).ToArray();
+        foreach (var obj in objects)
+        {
+            if (obj is not IBattleChara b || b.ObjectKind != ObjectKind.BattleNpc || !b.IsCasting ||
+                !gui.WorldToScreen(b.Position, out var position)) continue;
+            var isInterrupt = b.CastActionId == 49524 || b.IsCastInterruptible;
+            var remaining = b.TotalCastTime - b.CurrentCastTime;
+            if (!IsUrgentCast(isInterrupt, remaining)) continue;
+            var match = InterruptIndex(words.Select(word => word.CenterX).ToArray(), position.X);
+            if (match < 0) continue;
+            var target = targets[match];
+            var rank = config.Rank(isInterrupt ? TargetPriority.Interruptible : TargetPriority.Casting);
+            if (rank < target.Rank) targets[match] = (target.Word, target.Y, target.CenterX, rank,
+                float.IsFinite(remaining) && remaining >= 0 ? remaining : float.PositiveInfinity);
+        }
+        foreach (var target in targets)
+            ranks[target.Word] = Math.Min(ranks.GetValueOrDefault(target.Word, int.MaxValue), target.Rank);
+        return OrderTargets(targets.Select(t => (t.Word, t.Y, t.Rank, t.Remaining)));
+    }
+
+    internal static string[] OrderTargets(IEnumerable<(string Word, float Y, int Rank, float Remaining)> targets) =>
+        targets.OrderBy(t => t.Rank).ThenBy(t => t.Remaining).ThenByDescending(t => t.Y).Select(t => t.Word).ToArray();
+
+    // shortcut: 250 ms permits observed UI updates; replace with explicit acceptance if exposed.
+    internal static bool CanRetrySubmitted(bool stillVisible, long elapsed) => !stillVisible || elapsed >= 250;
+    internal static string[] EligibleWords(IEnumerable<string> words, IEnumerable<string> pending) => words.Except(pending).ToArray();
+
+    internal static int InterruptIndex(IReadOnlyList<float> centers, float casterX)
+    {
+        if (!float.IsFinite(casterX)) return -1;
+        var best = -1;
+        var distance = float.PositiveInfinity;
+        var second = float.PositiveInfinity;
+        for (var i = 0; i < centers.Count; i++)
+        {
+            var current = MathF.Abs(centers[i] - casterX);
+            if (current < distance) { second = distance; distance = current; best = i; }
+            else if (current < second) second = current;
+        }
+        // Position matching is provisional; skip overlapping or distant labels.
+        return distance <= 45 && second - distance >= 20 ? best : -1;
     }
 
     internal static string[] OrderWords(IEnumerable<(string Word, float Y)> words) =>
@@ -202,5 +296,13 @@ internal sealed unsafe class Pilot(IGameGui gui, IClientState client, IObjectTab
         return length == 512 ? null : Encoding.UTF8.GetString(new ReadOnlySpan<byte>(p, length));
     }
     internal static bool IsSafePhrase(string? value) => value is { Length: > 0 and <= 120 } && value.All(c => c is >= ' ' and <= '~') && !string.IsNullOrWhiteSpace(value);
-    internal static bool IsGaze(bool casting, uint action) => casting && action == 49529;
+    internal static bool IsUrgentCast(bool interrupt, float remaining) =>
+        interrupt || (float.IsFinite(remaining) && remaining is >= 0 and <= 8);
+    internal static bool IsDangerousCast(bool casting, float elapsed, float total) =>
+        casting && float.IsFinite(elapsed) && float.IsFinite(total) && total > 0 && elapsed >= 0 && elapsed / total >= 0.7f;
+    internal static string? FindResumable(IEnumerable<string> words, string text, string? submitted) =>
+        text.Length == 0 ? null : words.FirstOrDefault(word => word != submitted && word.StartsWith(text, StringComparison.OrdinalIgnoreCase));
+    internal static bool IsStopCast(bool casting, uint action) => casting && action is 49529 or 49532 or 49702;
+    internal static bool ShouldPrepareStop(bool casting, uint action, float elapsed, float total) =>
+        IsStopCast(casting, action) && (!float.IsFinite(elapsed) || !float.IsFinite(total) || elapsed < 0 || total <= 0 || elapsed / total >= 0.5f);
 }

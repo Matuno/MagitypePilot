@@ -6,14 +6,18 @@ An experimental Dalamud plugin that plays the Gold Saucer's Magitype typing game
 
 ## What it does
 
-- Types and submits visible phrases, choosing the lowest on-screen target first as a proximity estimate.
+- Types and submits visible phrases, using a configurable target order and the lowest on-screen target as a proximity estimate.
 - Recovers when a target disappears while its phrase is being typed, provided the input still matches the plugin's own text.
-- Pauses typing while the Magitype Cursed Gaze action is being cast. This behavior still needs in-game validation.
+- Pauses typing during Cursed Gaze and Dynamic Sensory Jammer, including a short provisional delay after the cast.
+- Attempts to prioritize interruptible casts, including Magitype's flashing ??? Needles, when the caster can be matched confidently to a visible phrase by screen position.
+- Automatically registers again from the Magitype lobby while the plugin is enabled.
+- Types at a fast human pace by default, speeding up when an enemy cast reaches 70% progress. Optional ludicrous speed types as fast as the game update loop permits.
+- Offers an experimental option to mute sounds made by automated text entry.
 - Refreshes the game's activity timers while entering text. The plugin uses the game's text field and can operate without the game window in focus.
 
-Open `/magitypepilot` and choose **Disable** to stop automatic play. Closing the window does not disable it. Reloading the plugin enables it again. If the input box contains text the plugin cannot identify as its own, it waits for you to clear it.
+Open `/magitypepilot` to reorder targets and change the speed and sound settings. Stop-typing mechanics always take precedence. Barrier recognition is not implemented yet. Choose **Disable** to stop automatic play and registration. Closing the window does not disable it. Reloading the plugin enables it again. The pilot resumes matching partial input or submits unmatched input to recover; disable it before typing manually if you do not want that text submitted.
 
-This is a work in progress. Interruptible targets are not yet prioritized, background play and the Cursed Gaze pause need further testing, and game updates can cause the plugin to pause until it is updated. Supervise it while playing.
+This is a work in progress. Automatic requeueing, the stop-typing delay, cast matching and background play need further testing, and game updates can cause the plugin to pause until it is updated. Supervise it while playing.
 
 ## Install
 
