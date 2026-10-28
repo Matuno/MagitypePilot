@@ -29,6 +29,7 @@ public sealed partial class Plugin : IDalamudPlugin
     private readonly Pilot pilot;
     private readonly Configuration config;
     private readonly GameInput input;
+    private readonly DirectActions directActions;
     private string? saveError;
     private bool open = true;
     private readonly object sync = new();
@@ -48,9 +49,14 @@ public sealed partial class Plugin : IDalamudPlugin
         this.framework = framework;
         this.clientState = clientState;
         this.log = log;
+        this.directActions = new DirectActions(scanner, log, clientState, objects);
+        this.pilot.Direct = this.directActions;
 #if WORKSPACE_TESTS
         try
         {
+            this.directActions.SetInterop(interop);
+            this.pilot.Debug = true;
+            this.directActions.SetDebug(true);
             this.assemblySha256 = GetAssemblySha256(pluginInterface.AssemblyLocation);
             this.listTests = pluginInterface.GetIpcProvider<string>(
                 "DalamudWorkspace.ListTests.v1.MagitypePilot");
@@ -98,6 +104,7 @@ public sealed partial class Plugin : IDalamudPlugin
         lock (this.sync) this.pilot.Stop("Plugin unloaded.");
         this.framework.Update -= this.Update;
         this.input.Dispose();
+        this.directActions.Dispose();
         this.pluginInterface.UiBuilder.Draw -= this.Draw;
         this.pluginInterface.UiBuilder.OpenMainUi -= this.Open;
         this.commands.RemoveHandler("/magitypepilot");
@@ -197,8 +204,16 @@ public sealed partial class Plugin : IDalamudPlugin
             if (!this.input.QuietAudioAvailable) ImGui.TextWrapped("Typing sound muting is unavailable on this game build.");
             if (this.saveError != null) ImGui.TextWrapped(this.saveError);
             var debug = this.pilot.Debug;
-            if (ImGui.Checkbox("Debug activity logging", ref debug)) this.pilot.Debug = debug;
-            if (debug) ImGui.TextUnformatted($"Suppressed sounds: {this.input.MutedSounds}");
+            if (ImGui.Checkbox("Debug activity logging", ref debug))
+            {
+                this.pilot.Debug = debug;
+                this.directActions.SetDebug(debug);
+            }
+            if (debug)
+            {
+                ImGui.TextUnformatted($"Suppressed sounds: {this.input.MutedSounds}");
+                ImGui.TextDisabled(this.directActions.Available ? "Experimental direct actions active." : "Direct actions unavailable; using typing.");
+            }
             ImGui.TextWrapped("Enabled when loaded. Disable to stop play; existing queues are not cancelled.");
         }
         ImGui.End();

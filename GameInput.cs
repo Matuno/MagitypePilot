@@ -63,6 +63,7 @@ internal sealed unsafe class GameInput : IDisposable
     private const string ActivityUpdateHash = "F2AFDD0B860B7C704E1A6FA8FAA821558F38ABCDC793FD036E1D5FBCAA82631F";
     private bool? codeMatches;
     private int activityUpdates;
+    private int keepAliveUpdates;
 
     [StructLayout(LayoutKind.Explicit, Size = 12)]
     private struct ActivityCounters
@@ -74,7 +75,7 @@ internal sealed unsafe class GameInput : IDisposable
     }
 
     internal readonly record struct ActivityStatus(bool Available, string Reason, float? IdleSeconds,
-        float? SinceDifferentKeySeconds, ushort? Repeats, int RecordedInputs);
+        float? SinceDifferentKeySeconds, ushort? Repeats, int RecordedInputs, int KeepAliveUpdates);
 
     private AtkComponentTextInput* GetInput()
     {
@@ -125,7 +126,19 @@ internal sealed unsafe class GameInput : IDisposable
     {
         var available = TryGetActivity(out var counters, out var reason);
         return new(available, reason, available ? counters->Idle : null,
-            available ? counters->SinceDifferentKey : null, available ? counters->Repeats : null, activityUpdates);
+            available ? counters->SinceDifferentKey : null, available ? counters->Repeats : null, activityUpdates, keepAliveUpdates);
+    }
+
+    // The caller limits this to an enabled pilot inside Magitype.
+    internal bool KeepAlive()
+    {
+        if (!TryGetActivity(out var counters, out _)) return false;
+        counters->Idle = counters->SinceDifferentKey = 0;
+        var shared = InputTimerModule.Instance();
+        if (shared == null) return false;
+        shared->AfkTimer = shared->ContentInputTimer = shared->InputTimer = 0;
+        keepAliveUpdates++;
+        return true;
     }
 
     private void RecordAcceptedInput()
@@ -136,6 +149,8 @@ internal sealed unsafe class GameInput : IDisposable
         if (shared != null) shared->AfkTimer = shared->ContentInputTimer = shared->InputTimer = 0;
         activityUpdates++;
     }
+
+    internal void RecordBypass() => RecordAcceptedInput();
 
     public bool TryType(string expected, string next, out string reason)
     {

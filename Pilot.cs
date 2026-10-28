@@ -17,6 +17,13 @@ internal sealed unsafe class Pilot(IGameGui gui, IClientState client, IObjectTab
     private bool hadGame;
     private long nextDebugLog;
     private long stopTypingUntil;
+    private long nextKeepAlive;
+    private long nextKeepAliveWarning;
+    internal DirectActions? Direct { get; set; }
+    private readonly Dictionary<string, long> bypassPending = new(StringComparer.Ordinal);
+    private readonly HashSet<string> bypassFallback = new(StringComparer.Ordinal);
+    private string? bypassPhrase;
+    private long bypassStarted;
     public bool Debug { get; set; }
     public bool Armed { get; private set; } = true;
     private string status = "Enabled; waiting for Magitype.";
@@ -54,6 +61,10 @@ internal sealed unsafe class Pilot(IGameGui gui, IClientState client, IObjectTab
         hadGame = false;
         next = 0;
         stopTypingUntil = 0;
+        bypassPending.Clear();
+        bypassFallback.Clear();
+        bypassPhrase = null;
+        bypassStarted = 0;
     }
 
     public void Update()
@@ -63,7 +74,17 @@ internal sealed unsafe class Pilot(IGameGui gui, IClientState client, IObjectTab
             log.Information("Magitype Pilot activity: {Activity}", input.CaptureActivity());
             nextDebugLog = Environment.TickCount64 + 2000;
         }
+        if (Armed) { Direct?.Start(); Direct?.UpdatePlayer(); }
         if (!Armed) return;
+        if (ShouldKeepAlive(client.IsLoggedIn, client.IsPvP, client.TerritoryType, Environment.TickCount64, nextKeepAlive))
+        {
+            nextKeepAlive = Environment.TickCount64 + 5000;
+            if (!input.KeepAlive() && Environment.TickCount64 >= nextKeepAliveWarning)
+            {
+                nextKeepAliveWarning = Environment.TickCount64 + 30000;
+                log.Warning("Magitype Pilot: activity watchdog could not verify or reset the game timers.");
+            }
+        }
         var wait = !client.IsLoggedIn ? "Waiting for login." : client.IsPvP ? "Waiting: PvP is active." :
             !Ready() ? queue.Update(config.AutoExit == true, config.AutoRequeue) ?? "Waiting for Magitype UI." : null;
         if (wait != null)
@@ -92,6 +113,7 @@ internal sealed unsafe class Pilot(IGameGui gui, IClientState client, IObjectTab
         if (Environment.TickCount64 < stopTypingUntil ||
             objects.LocalPlayer?.StatusList.Any(effect => effect.StatusId is 5346 or 5437) == true)
         {
+            bypassPhrase = null;
             Status = "Stop-typing mechanic: waiting for the effect to finish.";
             return;
         }
@@ -100,8 +122,55 @@ internal sealed unsafe class Pilot(IGameGui gui, IClientState client, IObjectTab
         foreach (var entry in pending.ToArray())
             if (CanRetrySubmitted(words.Contains(entry.Key), Environment.TickCount64 - entry.Value))
                 pending.Remove(entry.Key);
-        var eligible = EligibleWords(words, pending.Keys);
+        bypassFallback.RemoveWhere(word => !words.Contains(word));
+        foreach (var entry in bypassPending.ToArray())
+        {
+            if (!words.Contains(entry.Key)) bypassPending.Remove(entry.Key);
+            else if (ShouldFallback(Environment.TickCount64 - entry.Value))
+            {
+                bypassPending.Remove(entry.Key);
+                bypassFallback.Add(entry.Key);
+                log.Information("Magitype Pilot: target unchanged after bypass; returning to typing.");
+            }
+        }
+        var eligible = EligibleWords(words, pending.Keys.Concat(bypassPending.Keys));
         var priority = eligible.FirstOrDefault();
+        if (phrase == null && priority != null && !bypassFallback.Contains(priority) && Direct != null && input.ReadText() == string.Empty)
+        {
+            if (bypassPhrase != priority)
+            {
+                bypassPhrase = null;
+                if (Direct.TryResolve(priority, gui, objects, out _, out _))
+                {
+                    bypassPhrase = priority;
+                    bypassStarted = Environment.TickCount64;
+                }
+            }
+            if (bypassPhrase == priority)
+            {
+                var waitMs = BypassWait(priority.Length, config.TypingDelay);
+                if (Environment.TickCount64 - bypassStarted < waitMs)
+                {
+                    Status = "Preparing target at the selected typing speed.";
+                    next = Environment.TickCount64 + Math.Min(100, Math.Max(1, config.TypingDelay));
+                    return;
+                }
+                bypassPhrase = null;
+                if (Direct.TryResolve(priority, gui, objects, out var director, out var target))
+                {
+                    var sent = Direct.Dispatch(director, target, out var attempted);
+                    if (attempted)
+                    {
+                        bypassPending[priority] = Environment.TickCount64;
+                        if (sent) input.RecordBypass();
+                        log.Information("Magitype Pilot bypass: client result={Result}; waiting for the phrase to change.", sent);
+                        Status = sent ? "Bypass dispatched; waiting for target change." : "Bypass unconfirmed; waiting for target change.";
+                        return;
+                    }
+                }
+            }
+        }
+        else bypassPhrase = null;
         if (phrase != null && priority != null && phrase != priority && ranks.GetValueOrDefault(priority, int.MaxValue) < ranks.GetValueOrDefault(phrase, int.MaxValue) &&
             (index == 0 ? input.ReadText() == string.Empty : input.ClearOwnedText(phrase[..index])))
         {
@@ -272,6 +341,10 @@ internal sealed unsafe class Pilot(IGameGui gui, IClientState client, IObjectTab
     internal static string[] OrderTargets(IEnumerable<(string Word, float Y, int Rank, float Remaining)> targets) =>
         targets.OrderBy(t => t.Rank).ThenBy(t => t.Remaining).ThenByDescending(t => t.Y).Select(t => t.Word).ToArray();
 
+    internal static long BypassWait(int length, int delay) => (long)Math.Max(0, length - 1) * delay;
+    internal static bool ShouldFallback(long elapsed) => elapsed >= 5000;
+    internal static bool ShouldKeepAlive(bool loggedIn, bool pvp, uint territory, long now, long next) =>
+        loggedIn && !pvp && territory == 1359 && now >= next;
     internal static int SubmissionDelay(string? input) => input == string.Empty ? 0 : 100;
     // shortcut: 250 ms permits observed UI updates; replace with explicit acceptance if exposed.
     internal static bool CanRetrySubmitted(bool stillVisible, long elapsed) => !stillVisible || elapsed >= 250;

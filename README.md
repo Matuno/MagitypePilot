@@ -6,7 +6,7 @@ An experimental Dalamud plugin that plays the Gold Saucer's Magitype typing game
 
 ## What it does
 
-- Types and submits visible phrases, using a configurable target order and the lowest on-screen target as a proximity estimate.
+- Attempts to complete uniquely matched targets without typing, using a configurable target order and the lowest on-screen target as a proximity estimate. Falls back to typing when matching or direct actions are unavailable.
 - Recovers when a target disappears while its phrase is being typed, provided the input still matches the plugin's own text.
 - Pauses typing during Cursed Gaze and Dynamic Sensory Jammer, including a short provisional delay after the cast.
 - Attempts to prioritize interruptible casts, including Magitype's flashing ??? Needles, when the caster can be matched confidently to a visible phrase by screen position.
@@ -14,11 +14,11 @@ An experimental Dalamud plugin that plays the Gold Saucer's Magitype typing game
 - Optionally exits results and requeues from the Magitype lobby, with separate controls for each action.
 - Choose an average human (~50 WPM), 90 WPM, fast human (~120 WPM, the default), or ludicrous typing speed. Ludicrous speed types as fast as the game update loop permits.
 - Offers an experimental option to mute sounds made by automated text entry.
-- Refreshes the game's activity timers while entering text. The plugin uses the game's text field and can operate without the game window in focus.
+- Refreshes the game's activity timers during enabled Magitype duties, including when input is stalled. It can operate without the game window in focus.
 
-Open `/magitypepilot` to reorder targets and change the speed, automatic exit, requeue, and sound settings. If automatic exit is off, requeue waits until you return to the lobby. Stop-typing mechanics always take precedence. Barrier recognition is experimental and uses observed game UI and object data. Choose **Disable** to stop automatic play and registration. Closing the window does not disable it. Reloading the plugin enables it again. The pilot resumes matching partial input or submits unmatched input to recover; disable it before typing manually if you do not want that text submitted.
+Open `/magitypepilot` to reorder targets and change the speed, automatic exit, requeue, and sound settings. If automatic exit is off, requeue waits until you return to the lobby. Stop-typing mechanics always take precedence. Barrier recognition is experimental and uses observed game UI and object data. Direct actions use the same selected speed and pause for stop-typing mechanics; if a target remains unchanged after a direct request, the pilot falls back to typing. Choose **Disable** to stop automatic play and registration. Closing the window does not disable it. Reloading the plugin enables it again. The pilot resumes matching partial input or submits unmatched input to recover; disable it before typing manually if you do not want that text submitted.
 
-This is a work in progress. Automatic requeueing, the stop-typing delay, cast matching and background play need further testing, and game updates can cause the plugin to pause until it is updated. Supervise it while playing.
+This is a work in progress. Direct action matching, automatic requeueing, the stop-typing delay, cast matching and background play need further testing, and game updates can cause the plugin to fall back to typing or pause until it is updated. Supervise it while playing.
 
 ## Install
 
