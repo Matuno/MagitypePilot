@@ -95,7 +95,6 @@ internal sealed unsafe class Pilot(IGameGui gui, IClientState client, IObjectTab
             Status = "Stop-typing mechanic: waiting for the effect to finish.";
             return;
         }
-        if (config.Speed == TypingSpeed.Ludicrous) next = 0;
         if (Environment.TickCount64 < next) return;
         var words = ReadWords(out var ranks);
         foreach (var entry in pending.ToArray())
@@ -132,7 +131,7 @@ internal sealed unsafe class Pilot(IGameGui gui, IClientState client, IObjectTab
                     if (input.TrySubmit(text, out var recovery))
                     {
                         log.Information("Magitype Pilot: submitted unmatched input for recovery. {Result}", recovery);
-                        next = input.ReadText() == string.Empty ? 0 : Environment.TickCount64 + 100;
+                        next = Environment.TickCount64 + SubmissionDelay(input.ReadText());
                     }
                     else
                     {
@@ -193,7 +192,7 @@ internal sealed unsafe class Pilot(IGameGui gui, IClientState client, IObjectTab
             log.Information("Magitype Pilot: {Count} characters confirmed. {Result}", index, reason);
             pending[phrase] = Environment.TickCount64;
             phrase = null;
-            next = 0;
+            next = Environment.TickCount64 + SubmissionDelay(input.ReadText());
             Status = "Submitted; waiting for the next phrase.";
         }
     }
@@ -214,9 +213,14 @@ internal sealed unsafe class Pilot(IGameGui gui, IClientState client, IObjectTab
         if (addon == null) return [];
         var u = &addon->UldManager;
         if (u->NodeList == null || u->NodeListCount > 512) return [];
-        var barrierPresent = objects.Any(o => o.ObjectKind == ObjectKind.BattleNpc && o.BaseId == 20079 && o.IsTargetable && !o.IsDead);
-        var barrierNeedsReinforcement = objects.Any(o => o is IBattleChara b && b.ObjectKind == ObjectKind.BattleNpc &&
-            b.BaseId == 20079 && b.IsTargetable && !b.IsDead && b.MaxHp > 0 && b.CurrentHp < b.MaxHp);
+        var barrierPresent = false;
+        var barrierNeedsReinforcement = false;
+        foreach (var obj in objects)
+        {
+            if (obj.ObjectKind != ObjectKind.BattleNpc || obj.BaseId != 20079 || !obj.IsTargetable || obj.IsDead) continue;
+            barrierPresent = true;
+            barrierNeedsReinforcement |= obj is IBattleChara b && b.MaxHp > 0 && b.CurrentHp < b.MaxHp;
+        }
         var words = new List<(string Word, float Y, float CenterX, bool Barrier)>();
         for (var i = 0; i < u->NodeListCount; i++)
         {
@@ -237,6 +241,8 @@ internal sealed unsafe class Pilot(IGameGui gui, IClientState client, IObjectTab
                         IsBarrierLabel(barrierPresent, textNode->TextColor.R, textNode->TextColor.G, textNode->TextColor.B)));
             }
         }
+        if (words.Count == 0) return [];
+        var centers = words.Select(word => word.CenterX).ToArray();
         var targets = words.Select(word => (word.Word, word.Y, word.CenterX,
             Rank: word.Barrier ? Math.Min(config.Rank(TargetPriority.Barrier), config.Rank(TargetPriority.Closest)) : config.Rank(TargetPriority.Closest),
             Remaining: float.PositiveInfinity)).ToArray();
@@ -248,7 +254,7 @@ internal sealed unsafe class Pilot(IGameGui gui, IClientState client, IObjectTab
             var isInterrupt = b.CastActionId == 49524 || b.IsCastInterruptible;
             var remaining = b.TotalCastTime - b.CurrentCastTime;
             if (!ShouldPrioritizeCast(isInterrupt, b.CastActionId, remaining, actionableBarrier)) continue;
-            var match = InterruptIndex(words.Select(word => word.CenterX).ToArray(), position.X);
+            var match = InterruptIndex(centers, position.X);
             if (match < 0) continue;
             var target = targets[match];
             var rank = config.Rank(isInterrupt ? TargetPriority.Interruptible : TargetPriority.Casting);
@@ -266,6 +272,7 @@ internal sealed unsafe class Pilot(IGameGui gui, IClientState client, IObjectTab
     internal static string[] OrderTargets(IEnumerable<(string Word, float Y, int Rank, float Remaining)> targets) =>
         targets.OrderBy(t => t.Rank).ThenBy(t => t.Remaining).ThenByDescending(t => t.Y).Select(t => t.Word).ToArray();
 
+    internal static int SubmissionDelay(string? input) => input == string.Empty ? 0 : 100;
     // shortcut: 250 ms permits observed UI updates; replace with explicit acceptance if exposed.
     internal static bool CanRetrySubmitted(bool stillVisible, long elapsed) => !stillVisible || elapsed >= 250;
     internal static string[] EligibleWords(IEnumerable<string> words, IEnumerable<string> pending) => words.Except(pending).ToArray();

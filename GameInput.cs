@@ -73,7 +73,7 @@ internal sealed unsafe class GameInput : IDisposable
         [FieldOffset(10)] public ushort Repeats;
     }
 
-    internal sealed record ActivityStatus(bool Available, string Reason, float? IdleSeconds,
+    internal readonly record struct ActivityStatus(bool Available, string Reason, float? IdleSeconds,
         float? SinceDifferentKeySeconds, ushort? Repeats, int RecordedInputs);
 
     private AtkComponentTextInput* GetInput()

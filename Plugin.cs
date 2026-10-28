@@ -49,23 +49,31 @@ public sealed partial class Plugin : IDalamudPlugin
         this.clientState = clientState;
         this.log = log;
 #if WORKSPACE_TESTS
-        this.assemblySha256 = GetAssemblySha256(pluginInterface.AssemblyLocation);
-        this.listTests = pluginInterface.GetIpcProvider<string>(
-            "DalamudWorkspace.ListTests.v1.MagitypePilot");
-        this.runTests = pluginInterface.GetIpcProvider<string, string>(
-            "DalamudWorkspace.RunTests.v1.MagitypePilot");
-
-        this.listTests.RegisterFunc(() => JsonSerializer.Serialize(new[]
-        {
-            new { name = "smoke", readOnly = true, description = "Checks the plugin's current live adapters." },
-        }));
         try
         {
-            this.runTests.RegisterFunc(this.RunWorkspaceTest);
+            this.assemblySha256 = GetAssemblySha256(pluginInterface.AssemblyLocation);
+            this.listTests = pluginInterface.GetIpcProvider<string>(
+                "DalamudWorkspace.ListTests.v1.MagitypePilot");
+            this.runTests = pluginInterface.GetIpcProvider<string, string>(
+                "DalamudWorkspace.RunTests.v1.MagitypePilot");
+
+            this.listTests.RegisterFunc(() => JsonSerializer.Serialize(new[]
+            {
+                new { name = "smoke", readOnly = true, description = "Checks the plugin's current live adapters." },
+            }));
+            try
+            {
+                this.runTests.RegisterFunc(this.RunWorkspaceTest);
+            }
+            catch
+            {
+                this.listTests.UnregisterFunc();
+                throw;
+            }
         }
         catch
         {
-            this.listTests.UnregisterFunc();
+            this.input.Dispose();
             throw;
         }
 #endif
@@ -143,17 +151,19 @@ public sealed partial class Plugin : IDalamudPlugin
             ImGui.TextColored(accent, "TARGET PRIORITY");
             ImGui.TextDisabled("Top priority first");
             ImGui.TextWrapped("Stop-typing mechanics always take precedence.");
+            var moveFrom = -1;
+            var moveTo = -1;
             for (var i = 0; i < this.config.Priorities.Count; i++)
             {
                 var item = this.config.Priorities[i];
                 ImGui.BeginDisabled(i == 0);
                 if (ImGui.SmallButton($"Up##{item}"))
-                { (this.config.Priorities[i - 1], this.config.Priorities[i]) = (item, this.config.Priorities[i - 1]); this.Save(); }
+                { moveFrom = i; moveTo = i - 1; }
                 ImGui.EndDisabled();
                 ImGui.SameLine();
                 ImGui.BeginDisabled(i == this.config.Priorities.Count - 1);
                 if (ImGui.SmallButton($"Down##{item}"))
-                { (this.config.Priorities[i + 1], this.config.Priorities[i]) = (item, this.config.Priorities[i + 1]); this.Save(); }
+                { moveFrom = i; moveTo = i + 1; }
                 ImGui.EndDisabled();
                 ImGui.SameLine();
                 ImGui.TextUnformatted(item switch
@@ -163,6 +173,11 @@ public sealed partial class Plugin : IDalamudPlugin
                     TargetPriority.Barrier => "Barrier reinforcement (experimental)",
                     _ => "Closest targets",
                 });
+            }
+            if (moveFrom >= 0)
+            {
+                (this.config.Priorities[moveFrom], this.config.Priorities[moveTo]) = (this.config.Priorities[moveTo], this.config.Priorities[moveFrom]);
+                this.Save();
             }
             ImGui.Spacing();
             ImGui.TextColored(accent, "PLAY SETTINGS");
